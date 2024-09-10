@@ -1,6 +1,7 @@
 import csv
 import re
 import logging
+from pydash.strings import snake_case
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,7 +19,11 @@ def generator_wrapper(reader):
 
             # replace whitespace with underscores
             formatted_key = re.sub(r"\s+", '_', formatted_key)
-            to_return[formatted_key.lower()] = value
+
+            # replace column name with snakecase
+            formatted_key = snake_case(formatted_key)
+
+            to_return[formatted_key] = value
         yield to_return
 
 

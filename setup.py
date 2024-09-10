@@ -19,7 +19,8 @@ setup(
         'xlrd',
         'paramiko',
         'azure-storage-blob>=12.14.0',
-        'pyarrow>=5.0.0'
+        'pyarrow>=5.0.0',
+        'pydash>=8.0.3',
     ],
     packages=["tap_spreadsheets_anywhere"],
     include_package_data=True,
