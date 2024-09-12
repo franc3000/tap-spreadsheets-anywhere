@@ -129,10 +129,22 @@ def sync(config, state, catalog):
                 schema=merged_schema,
                 key_properties=stream.key_properties,
             )
+
+            # Get the last modified date from the state, or the start_date from the table spec
             modified_since = dateutil.parser.parse(
                 state.get(stream.tap_stream_id, {}).get("modified_since") or table_spec["start_date"]
             )
 
+            LOGGER.warning(f"state: {state}")
+            LOGGER.warning(f"stream.tap_stream_id: {stream.tap_stream_id}")
+            LOGGER.warning(f"state.get(stream.tap_stream_id): {state.get(stream.tap_stream_id, {})}")
+            LOGGER.warning(f"state...modified_since: {state.get(stream.tap_stream_id, {}).get("modified_since")}")
+            LOGGER.warning(f"table_spec[start_date]: {table_spec["start_date"]}")
+            LOGGER.error(f"modified_since: {modified_since}")
+
+            # Before sending records, send the state in case the process gets interrupted or no records are streamed (to not lose the modified_since value)
+            singer.write_state(state)
+            
             target_files = file_utils.get_matching_objects(table_spec, modified_since)
             max_records_per_run = table_spec.get("max_records_per_run", -1)
             records_streamed = 0

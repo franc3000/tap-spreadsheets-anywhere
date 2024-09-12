@@ -168,11 +168,11 @@ def get_matching_objects(table_spec, modified_since=None):
 
         # noinspection PyTypeChecker
         if matcher.search(key) and (modified_since is None or modified_since < last_modified):
-            LOGGER.debug('Including key "{}"'.format(key))
-            LOGGER.debug("Last modified: {}".format(last_modified) + " comparing to {} ".format(modified_since))
+            LOGGER.info(f"including {key}")
+            LOGGER.info(f"last modified: {modified_since}, comparing to {last_modified}".format() + "  ".format())
             to_return.append({"key": key, "last_modified": last_modified})
         else:
-            LOGGER.debug('Not including key "{}"'.format(key))
+            LOGGER.info('Not including key "{}"'.format(key))
 
     if not LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.info(
