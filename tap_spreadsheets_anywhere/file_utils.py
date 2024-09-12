@@ -162,8 +162,9 @@ def get_matching_objects(table_spec, modified_since=None):
         key = obj["Key"]
         last_modified = obj["LastModified"]
 
-        LOGGER.warning(f"modifie since : {modified_since}")
-        LOGGER.warning(f"last modified : {last_modified}")
+        LOGGER.warning(
+            f"since : {modified_since} | last mod : {last_modified} | key : {key} | match : {matcher.search(key)}"
+        )
 
         # noinspection PyTypeChecker
         if matcher.search(key) and (modified_since is None or modified_since < last_modified):
