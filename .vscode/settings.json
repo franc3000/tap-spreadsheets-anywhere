@@ -1,0 +1,10 @@
+{
+	"[python]": {
+		"editor.defaultFormatter": "ms-python.black-formatter",
+		"editor.codeActionsOnSave": {
+			"source.organizeImports": "explicit"
+		},
+		"editor.insertSpaces": true,
+		"editor.formatOnSave": true,
+	},
+}
