@@ -3,10 +3,16 @@ import logging
 import re
 import sys
 
+from pydash.strings import snake_case
+
 LOGGER = logging.getLogger(__name__)
 
 
 def format_key(key):
+    return snake_case(key)
+
+
+def format_key_orig(key):
     formatted_key = key
     # remove non-word, non-whitespace characters
     formatted_key = re.sub(r"[^\w\s]", "", formatted_key)
