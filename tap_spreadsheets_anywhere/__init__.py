@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import dateutil
 import singer
@@ -10,6 +11,7 @@ from singer.schema import Schema
 
 import tap_spreadsheets_anywhere.conversion as conversion
 import tap_spreadsheets_anywhere.file_utils as file_utils
+import tap_spreadsheets_anywhere.format_handler
 from tap_spreadsheets_anywhere.configuration import Config
 
 LOGGER = logging.getLogger(__name__)
@@ -49,17 +51,11 @@ def generate_schema(table_spec, samples):
         "_smart_source_file": {"type": "string"},
         "_smart_source_lineno": {"type": "integer"},
     }
-
     prefer_number_vs_integer = table_spec.get("prefer_number_vs_integer", False)
-
     prefer_schema_as_string = table_spec.get("prefer_schema_as_string", False)
-
     data_schema = conversion.generate_schema(
-        samples,
-        prefer_number_vs_integer=prefer_number_vs_integer,
-        prefer_schema_as_string=prefer_schema_as_string,
+        samples, prefer_number_vs_integer=prefer_number_vs_integer, prefer_schema_as_string=prefer_schema_as_string
     )
-
     inferred_schema = {"type": "object", "properties": merge_dicts(data_schema, metadata_schema)}
 
     merged_schema = override_schema_with_config(inferred_schema, table_spec)
@@ -113,14 +109,10 @@ def discover(config):
 def sync(config, state, catalog):
     # Loop over selected streams in catalog
     LOGGER.info(f"Processing {len(list(catalog.get_selected_streams(state)))} selected streams from Catalog")
-
     for stream in catalog.get_selected_streams(state):
         LOGGER.info("Syncing stream:" + stream.tap_stream_id)
-
         catalog_schema = stream.schema.to_dict()
-
         table_spec = next((x for x in config["tables"] if x["name"] == stream.tap_stream_id), None)
-
         if table_spec is not None:
             # Allow updates to our tables specification to override any previously extracted schema in the catalog
             merged_schema = override_schema_with_config(catalog_schema, table_spec)
@@ -129,43 +121,56 @@ def sync(config, state, catalog):
                 schema=merged_schema,
                 key_properties=stream.key_properties,
             )
-
-            # Get the last modified date from the state, or the start_date from the table spec
             modified_since = dateutil.parser.parse(
                 state.get(stream.tap_stream_id, {}).get("modified_since") or table_spec["start_date"]
             )
-
-            LOGGER.warning(f"state: {state}")
-            LOGGER.warning(f"stream.tap_stream_id: {stream.tap_stream_id}")
-            LOGGER.warning(f"state.get(stream.tap_stream_id): {state.get(stream.tap_stream_id, {})}")
-            LOGGER.warning(f"state...modified_since: {state.get(stream.tap_stream_id, {}).get("modified_since")}")
-            LOGGER.warning(f"table_spec[start_date]: {table_spec["start_date"]}")
-            LOGGER.error(f"modified_since: {modified_since}")
-
             # Before sending records, send the state in case the process gets interrupted or no records are streamed (to not lose the modified_since value)
             singer.write_state(state)
-            
             target_files = file_utils.get_matching_objects(table_spec, modified_since)
             max_records_per_run = table_spec.get("max_records_per_run", -1)
+            num_files_to_prefetch = table_spec.get("num_files_to_prefetch", 1)
             records_streamed = 0
 
-            for t_file in target_files:
-                records_streamed += file_utils.write_file(
-                    t_file["key"], table_spec, merged_schema, max_records=max_records_per_run - records_streamed
-                )
-                if 0 < max_records_per_run <= records_streamed:
-                    LOGGER.info(
-                        f'Processed the per-run limit of {records_streamed} records for stream "{stream.tap_stream_id}". Stopping sync for this stream.'
-                    )
-                    break
-                state[stream.tap_stream_id] = {"modified_since": t_file["last_modified"].isoformat()}
-                singer.write_state(state)
+            with ThreadPoolExecutor(max_workers=num_files_to_prefetch) as pool:
+                for prefetch_batch in sublists(target_files, num_files_to_prefetch):
+                    futures = {}
+                    for t_file in prefetch_batch:
+                        target_uri = file_utils.resolve_target_uri(table_spec, t_file["key"])
+                        try:
+                            futures[t_file["key"]] = pool.submit(
+                                tap_spreadsheets_anywhere.format_handler.get_row_iterator, table_spec, target_uri
+                            )
+                        except tap_spreadsheets_anywhere.format_handler.InvalidFormatError as ife:
+                            if table_spec.get("invalid_format_action", "fail").lower() == "ignore":
+                                LOGGER.exception(f"Ignoring unparseable file: {t_file['key']}", ife)
+                            else:
+                                raise ife
+                    for t_file in prefetch_batch:
+                        records_streamed += file_utils.write_file(
+                            futures[t_file["key"]].result(),
+                            t_file["key"],
+                            table_spec,
+                            merged_schema,
+                            max_records=max_records_per_run - records_streamed,
+                        )
+                        if 0 < max_records_per_run <= records_streamed:
+                            LOGGER.info(
+                                f'Processed the per-run limit of {records_streamed} records for stream "{stream.tap_stream_id}". Stopping sync for this stream.'
+                            )
+                            break
+                        state[stream.tap_stream_id] = {"modified_since": t_file["last_modified"].isoformat()}
+                        singer.write_state(state)
 
             LOGGER.info(f'Wrote {records_streamed} records for stream "{stream.tap_stream_id}".')
-            LOGGER.info(f"Updated state for stream '{stream.tap_stream_id}' to {state[stream.tap_stream_id]}")
         else:
             LOGGER.warning(f"Skipping processing for stream [{stream.tap_stream_id}] without a config block.")
     return
+
+
+def sublists(list, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(list), n):
+        yield list[i : i + n]
 
 
 REQUIRED_CONFIG_KEYS = "tables"
@@ -176,16 +181,13 @@ def main():
     # Parse command line arguments
     args = utils.parse_args([REQUIRED_CONFIG_KEYS])
     crawl_paths = [x for x in args.config["tables"] if "crawl_config" in x and x["crawl_config"]]
-
     if len(crawl_paths) > 0:  # Our config includes at least one crawl block
         LOGGER.info("Executing experimental 'crawl' mode to auto-generate a table config per bucket.")
         tables_config = file_utils.config_by_crawl(crawl_paths)
-
         # Add back in the non-crawl blocks
         tables_config["tables"] += [
             x for x in args.config["tables"] if "crawl_config" not in x or not x["crawl_config"]
         ]
-
         crawl_results_file = "crawled-config.json"
         LOGGER.info(f"Writing expanded crawl blocks to {crawl_results_file}.")
         Config.dump(tables_config, open(crawl_results_file, "w"))
@@ -193,7 +195,6 @@ def main():
         tables_config = args.config
 
     tables_config = Config.validate(tables_config)
-
     # If discover flag was passed, run discovery mode and dump output to stdout
     if args.discover:
         catalog = discover(tables_config)

@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from os import walk
 
 import boto3
@@ -40,39 +40,35 @@ def _hide_credentials(path):
     return path
 
 
-def write_file(target_filename, table_spec, schema, max_records=-1):
+def write_file(source_iterator, target_filename, table_spec, schema, max_records=-1):
     LOGGER.info('Syncing file "{}".'.format(target_filename))
-    target_uri = resolve_target_uri(table_spec, target_filename)
+
+    if source_iterator is None:
+        LOGGER.info('Skipping syncing file "{}".'.format(target_filename))
+        return 0
+
     records_synced = 0
-    try:
-        iterator = tap_spreadsheets_anywhere.format_handler.get_row_iterator(table_spec, target_uri)
-        for row in iterator:
-            metadata = {
-                "_smart_source_bucket": _hide_credentials(table_spec["path"]),
-                "_smart_source_file": target_filename,
-                # index zero, +1 for header row
-                "_smart_source_lineno": records_synced + 2,
-            }
+    for row in source_iterator:
+        metadata = {
+            "_smart_source_bucket": _hide_credentials(table_spec["path"]),
+            "_smart_source_file": target_filename,
+            # index zero, +1 for header row
+            "_smart_source_lineno": records_synced + 2,
+        }
 
-            try:
-                record_with_meta = {**conversion.convert_row(row, schema), **metadata}
-                singer.write_record(table_spec["name"], record_with_meta)
-            except BrokenPipeError as bpe:
-                LOGGER.error(
-                    f"Pipe to loader broke after {records_synced} records were written from {target_filename}: troubled "
-                    f"line was {record_with_meta}"
-                )
-                raise bpe
+        try:
+            record_with_meta = {**conversion.convert_row(row, schema), **metadata}
+            singer.write_record(table_spec["name"], record_with_meta)
+        except BrokenPipeError as bpe:
+            LOGGER.error(
+                f"Pipe to loader broke after {records_synced} records were written from {target_filename}: troubled "
+                f"line was {record_with_meta}"
+            )
+            raise bpe
 
-            records_synced += 1
-            if 0 < max_records <= records_synced:
-                break
-
-    except tap_spreadsheets_anywhere.format_handler.InvalidFormatError as ife:
-        if table_spec.get("invalid_format_action", "fail").lower() == "ignore":
-            LOGGER.exception(f"Ignoring unparseable file: {target_filename}", ife)
-        else:
-            raise ife
+        records_synced += 1
+        if 0 < max_records <= records_synced:
+            break
 
     return records_synced
 
@@ -124,15 +120,13 @@ def parse_path(path):
 
 
 def get_matching_objects(table_spec, modified_since=None):
-    LOGGER.debug("get_matching_objects")
-
     protocol, bucket = parse_path(table_spec["path"])
 
     # TODO Breakout the transport schemes here similar to the registry/loading pattern used by smart_open
     if protocol == "s3":
         target_objects = list_files_in_s3_bucket(bucket, table_spec.get("search_prefix"))
     elif protocol == "file":
-        target_objects = list_files_in_local_bucket(bucket, table_spec.get("search_prefix"))
+        target_objects = list_files_in_local_bucket(bucket)
     elif protocol in ["sftp"]:
         target_objects = list_files_in_SSH_bucket(table_spec["path"], table_spec.get("search_prefix"))
     elif protocol in ["ftp"]:
@@ -162,17 +156,13 @@ def get_matching_objects(table_spec, modified_since=None):
         key = obj["Key"]
         last_modified = obj["LastModified"]
 
-        LOGGER.warning(
-            f"since : {modified_since} | last mod : {last_modified} | key : {key} | match : {matcher.search(key)}"
-        )
-
         # noinspection PyTypeChecker
         if matcher.search(key) and (modified_since is None or modified_since < last_modified):
-            LOGGER.info(f"including {key}")
-            LOGGER.info(f"last modified: {modified_since}, comparing to {last_modified}".format() + "  ".format())
+            LOGGER.debug('Including key "{}"'.format(key))
+            LOGGER.debug("Last modified: {}".format(last_modified) + " comparing to {} ".format(modified_since))
             to_return.append({"key": key, "last_modified": last_modified})
         else:
-            LOGGER.info('Not including key "{}"'.format(key))
+            LOGGER.debug('Not including key "{}"'.format(key))
 
     if not LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.info(
@@ -185,7 +175,7 @@ def list_files_in_SSH_bucket(uri, search_prefix=None):
     try:
         import paramiko
     except ImportError:
-        LOGGER.warn(
+        LOGGER.warning(
             "paramiko missing, opening SSH/SCP/SFTP paths will be disabled. " "`pip install paramiko` to suppress"
         )
         raise
@@ -210,19 +200,16 @@ def list_files_in_SSH_bucket(uri, search_prefix=None):
         if search_prefix is None or fnmatch.fnmatch(entry.filename, search_prefix):
             mode = entry.st_mode
             if S_ISREG(mode):
-                x = {
-                    "Key": entry.filename,
-                    "LastModified": datetime.fromtimestamp(entry.st_mtime, timezone.utc),
-                }
-                LOGGER.warning(f"entry: {x}")
-                entries.append(x)
+                entries.append(
+                    {"Key": entry.filename, "LastModified": datetime.fromtimestamp(entry.st_mtime, timezone.utc)}
+                )
             if len(entries) > max_results:
                 raise ValueError(
-                    f"Read more than {max_results} records from the path {uri_path}. Use a more specific search_prefix"
+                    f"Read more than {max_results} records from the path {uri_path}. Use a more specific "
+                    f"search_prefix"
                 )
 
     LOGGER.info("Found {} files.".format(entries))
-
     return entries
 
 
@@ -238,7 +225,6 @@ def convert_URL_to_file_list(table_spec):
             last_modified = datetime.now(tz=timezone.utc)
 
         filename = table_spec["pattern"]
-
         # TODO: logic below is disabled because we can't currently support reading filenames from Content-Disposition (Excel limitations)
         # if 'content-disposition' in r.headers:
         #     cd = r.headers['content-disposition']
@@ -294,23 +280,16 @@ def raise_error(error):
     raise error
 
 
-def list_files_in_local_bucket(bucket, search_prefix=None):
+def list_files_in_local_bucket(bucket):
     local_filenames = []
     path = bucket
-    if search_prefix is not None:
-        path = os.path.join(bucket, search_prefix)
 
     LOGGER.info(f"Walking {path}.")
-    max_results = 10000
     for dirpath, dirnames, filenames in walk(path, onerror=raise_error):
         for filename in filenames:
             abspath = os.path.join(dirpath, filename)
             relpath = os.path.relpath(abspath, path)
             local_filenames.append(relpath)
-        if len(local_filenames) > max_results:
-            raise ValueError(
-                f"Read more than {max_results} records from the path {path}. Use a more specific " f"search_prefix"
-            )
 
     LOGGER.info("Found {} files.".format(len(local_filenames)))
     # for filename in local_filenames:
@@ -358,9 +337,20 @@ def list_files_in_s3_bucket(bucket, search_prefix=None):
     if search_prefix is not None:
         args["Prefix"] = search_prefix
 
+    # We will ignore files that were added during the listing process.
+    # Otherwise we may skip files, as we list by lexigraphical order.
+    # 1 Minute delta, in order to take care of clock skew between S3 and our client
+    cutoff_datetime = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
+
+    LOGGER.info("Listing files up until {}.".format(cutoff_datetime))
+
     result = s3_client.list_objects_v2(**args)
     if result["KeyCount"] > 0:
-        s3_objects += result["Contents"]
+        s3_objects += [
+            {"Key": res["Key"], "LastModified": res["LastModified"]}
+            for res in result["Contents"]
+            if res["LastModified"] < cutoff_datetime
+        ]
         next_continuation_token = result.get("NextContinuationToken")
 
         while next_continuation_token is not None:
@@ -371,7 +361,14 @@ def list_files_in_s3_bucket(bucket, search_prefix=None):
 
             result = s3_client.list_objects_v2(**continuation_args)
 
-            s3_objects += result["Contents"]
+            s3_objects += [
+                {
+                    "Key": res["Key"],
+                    "LastModified": res["LastModified"],
+                }
+                for res in result["Contents"]
+                if res["LastModified"] < cutoff_datetime
+            ]
             next_continuation_token = result.get("NextContinuationToken")
 
     LOGGER.info("Found {} files.".format(len(s3_objects)))

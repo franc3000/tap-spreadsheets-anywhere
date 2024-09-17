@@ -19,12 +19,7 @@ This is a [Singer](https://singer.io) tap that reads data from spreadsheet files
 Multiple individual files with the same schema can be configured & ingested into the same "Table" for processing.
 
 ### Compression
-
-smart_open allows reading and writing gzip and bzip2 files. 
-
-They are transparently handled over HTTP, S3, and other protocols, too, based on the extension of the file being opened.
-
-
+smart_open allows reading and writing gzip and bzip2 files. They are transparently handled over HTTP, S3, and other protocols, too, based on the extension of the file being opened.
 
 ### Configuration
 
